@@ -299,12 +299,19 @@ namespace backend {
         jfieldID vid_field_id = java_env->GetFieldID(native_activity_clazz, "SDR_VID", "I");
         jfieldID pid_field_id = java_env->GetFieldID(native_activity_clazz, "SDR_PID", "I");
         
-        if (!vid_field_id || !vid_field_id || !pid_field_id)
+        if (!fd_field_id || !vid_field_id || !pid_field_id)
             return -1;
 
         int fd = java_env->GetIntField(app->activity->clazz, fd_field_id);
         vid = java_env->GetIntField(app->activity->clazz, vid_field_id);
         pid = java_env->GetIntField(app->activity->clazz, pid_field_id);
+
+        // No permission granted yet (or no device): report failure instead of
+        // handing an invalid descriptor to libusb, which crashes.
+        if (fd < 0) {
+            java_vm->DetachCurrentThread();
+            return -1;
+        }
 
         jni_return = java_vm->DetachCurrentThread();
         if (jni_return != JNI_OK)

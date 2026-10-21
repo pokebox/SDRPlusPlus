@@ -12,9 +12,15 @@ android {
         versionCode 1
         versionName "1.2.1"
 
+        // The target device is arm64-v8a and the dependency kit is built for
+        // that ABI only, so building the other three would just fail.
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+
         externalNativeBuild {
             cmake {
-                arguments "-DOPT_BACKEND_GLFW=OFF", "-DOPT_BACKEND_ANDROID=ON", "-DOPT_BUILD_SOAPY_SOURCE=OFF", "-DOPT_BUILD_ANDROID_AUDIO_SINK=ON", "-DOPT_BUILD_AUDIO_SINK=OFF", "-DOPT_BUILD_DISCORD_PRESENCE=OFF", "-DOPT_BUILD_M17_DECODER=ON", "-DOPT_BUILD_PLUTOSDR_SOURCE=ON", "-DOPT_BUILD_AUDIO_SOURCE=OFF", "-DOPT_BUILD_HYDRASDR_SOURCE=ON"
+                arguments "-DOPT_BACKEND_GLFW=OFF", "-DOPT_BACKEND_ANDROID=ON", "-DOPT_BUILD_SOAPY_SOURCE=OFF", "-DOPT_BUILD_ANDROID_AUDIO_SINK=ON", "-DOPT_BUILD_AUDIO_SINK=OFF", "-DOPT_BUILD_DISCORD_PRESENCE=OFF", "-DOPT_BUILD_M17_DECODER=OFF", "-DOPT_BUILD_PLUTOSDR_SOURCE=OFF", "-DOPT_BUILD_AUDIO_SOURCE=OFF", "-DOPT_BUILD_HYDRASDR_SOURCE=OFF", "-DOPT_BUILD_AIRSPY_SOURCE=OFF", "-DOPT_BUILD_AIRSPYHF_SOURCE=OFF", "-DOPT_BUILD_RTL_SDR_SOURCE=OFF"
             }
         }
     }
