@@ -10,6 +10,9 @@
 #include <utils/wav.h>
 #include <dsp/sink/handler_sink.h>
 #include <volk/volk.h>
+#ifdef __ANDROID__
+#include <android_backend.h>
+#endif
 #include <libhackrf/hackrf.h>
 
 #include <filesystem>
@@ -370,15 +373,32 @@ private:
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
         // 3. Open the device
+        hackrf_device* dev = NULL;
+        hackrf_error hErr = HACKRF_SUCCESS;
+
+#ifdef __ANDROID__
+        // Android hands out a USB file descriptor from the Java layer. Device
+        // enumeration is compiled out of libhackrf (DISABLE_USB_DEVICE_DISCOVERY),
+        // so hackrf_device_list() returns nothing and a serial cannot be used.
+        int vid = 0, pid = 0;
+        int fd = backend::getDeviceFD(vid, pid, backend::HACKRF_VIDPIDS);
+        if (fd < 0) {
+            resumeRx(wasPlaying);
+            fail("No HackRF device found.\nMake sure USB access was granted to SDR++ "
+                 "and the device is still connected.");
+            return;
+        }
+        hErr = (hackrf_error)hackrf_open_by_fd(fd, &dev);
+#else
         std::string serial = firstSerial();
         if (serial.empty()) {
             resumeRx(wasPlaying);
             fail("No HackRF device found.");
             return;
         }
+        hErr = (hackrf_error)hackrf_open_by_serial(serial.c_str(), &dev);
+#endif
 
-        hackrf_device* dev = NULL;
-        hackrf_error hErr = (hackrf_error)hackrf_open_by_serial(serial.c_str(), &dev);
         if (hErr != HACKRF_SUCCESS || !dev) {
             resumeRx(wasPlaying);
             fail(std::string("Could not open HackRF: ") + hackrf_error_name(hErr));

@@ -39,6 +39,16 @@ SDR++ 原生只有接收链路，本模块自带一条独立的 IQ 录制/回放
 - 采样率等于录制时选择的 VFO 采样率，回放时 1:1 使用，不做重采样。
 - 元数据 `.json`：`frequency`（Hz）、`sampleRate`、`samples`、`duration`、`timestamp`。
 
+## Android
+
+Android 上 libhackrf 是用 `DISABLE_USB_DEVICE_DISCOVERY` 编译的，`hackrf_device_list()`
+不会返回任何设备，串口方式无法使用。模块在这种情况下走 `backend::getDeviceFD()`
+取 Java 层传来的 USB 文件描述符，再用 `hackrf_open_by_fd()` 打开设备，
+与 `hackrf_source` 的做法一致。
+
+发射前同样会停止接收释放设备，发射结束后恢复。若提示找不到设备，
+确认系统已授予 SDR++ 的 USB 访问权限。
+
 ## 构建
 
 模块随主工程一起构建，依赖系统 `libhackrf`：
