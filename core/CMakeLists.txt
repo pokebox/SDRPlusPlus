@@ -33,6 +33,13 @@ add_library(sdrpp_core SHARED ${SRC} ${BACKEND_SRC})
 # Set compiler options
 target_compile_options(sdrpp_core PRIVATE ${SDRPP_COMPILER_FLAGS})
 
+# MSVC exports every symbol through CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS. MinGW has
+# no equivalent, and the plugin modules need symbols that are not marked with
+# SDRPP_EXPORT (ImGui, ConfigManager, style, ...), so export them explicitly.
+if (MINGW)
+    target_link_options(sdrpp_core PRIVATE "-Wl,--export-all-symbols")
+endif ()
+
 # Set the install prefix
 target_compile_definitions(sdrpp_core PUBLIC INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}")
 
@@ -158,6 +165,12 @@ else()
 
     if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
         target_link_libraries(sdrpp_core PUBLIC stdc++fs)
+    endif ()
+
+    # Winsock and the IP helper API are only linked in the MSVC branch above,
+    # but they are needed for any Windows toolchain (e.g. MinGW)
+    if (WIN32)
+        target_link_libraries(sdrpp_core PUBLIC ws2_32 iphlpapi)
     endif ()
 
 endif ()
