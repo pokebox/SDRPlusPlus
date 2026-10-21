@@ -26,6 +26,13 @@
 #include <ctime>
 #include <algorithm>
 
+#ifdef _WIN32
+#include <shellapi.h>
+#else
+#include <unistd.h>
+#include <sys/wait.h>
+#endif
+
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
 SDRPP_MOD_INFO{
@@ -61,6 +68,20 @@ static const char* REC_DEPTH_TXT = "Int16\0" "Float32\0";
 #define REC_DEPTH_INT16   0
 #define REC_DEPTH_FLOAT32 1
 
+// What to record. The waterfall modes follow the current view automatically, so
+// the recorded slice always matches what the operator is looking at.
+enum RecSource {
+    REC_SRC_WATERFALL = 0,  // whole source bandwidth, centred on the waterfall
+    REC_SRC_RADIO     = 1,  // follow the selected radio (VFO) in the waterfall
+    REC_SRC_MANUAL    = 2   // explicit sample rate, centred on the waterfall
+};
+static const char* REC_SOURCE_TXT = "Waterfall (auto)\0" "Active radio (auto)\0" "Manual\0";
+
+// libhackrf accepts roughly 2-20 MS/s for both directions. A recording outside
+// that window can be made but not transmitted, so the recorder clamps to it.
+#define HACKRF_MIN_TX_SR 2000000
+#define HACKRF_MAX_TX_SR 20000000
+
 // Upper bound for the preloaded transmit buffer (int8, 2 bytes per complex sample)
 #define MAX_TX_BYTES (1024ull * 1024ull * 1024ull)
 
@@ -84,7 +105,11 @@ class HackRFTxModule : public ModuleManager::Instance {
 public:
     HackRFTxModule(std::string name) {
         this->name = name;
-        this->recDir = (std::string)core::args["root"] + "/recordings";
+        // Build the path with the platform's own separator. Mixing '/' into a
+        // Windows path makes Explorer resolve it to the wrong folder.
+        this->recDir = (std::filesystem::path((std::string)core::args["root"]) / "recordings")
+                           .make_preferred()
+                           .string();
 
         // The source module also calls hackrf_init(). libusb reference counts its
         // own initialisation, so a second call is harmless, but we deliberately
@@ -109,6 +134,10 @@ public:
         }
         if (config.conf.contains("txVgaGain")) { txVga = std::clamp<int>(config.conf["txVgaGain"], 0, 47); }
         if (config.conf.contains("recDepth")) { recDepthId = std::clamp<int>(config.conf["recDepth"], 0, 1); }
+        if (config.conf.contains("recSource")) {
+            recSourceId = std::clamp<int>(config.conf["recSource"], 0, 2);
+            recSource = (RecSource)recSourceId;
+        }
         if (config.conf.contains("amp")) { amp = config.conf["amp"]; }
         if (config.conf.contains("txFreq")) { txFreq = config.conf["txFreq"]; }
         if (config.conf.contains("lastFile")) { lastFile = config.conf["lastFile"].get<std::string>(); }
@@ -156,18 +185,47 @@ private:
             return;
         }
 
+        // Resolve the slice to record from the current view
+        double srcSr = sigpath::iqFrontEnd.getSampleRate();
+        if (srcSr <= 0.0) {
+            showError("Could not determine the source sample rate.");
+            return;
+        }
+
+        double sr = 0.0;
+        double offset = 0.0;
+
+        if (recSource == REC_SRC_RADIO) {
+            std::string vfoName = gui::waterfall.selectedVFO;
+            if (vfoName.empty() || !sigpath::vfoManager.vfoExists(vfoName)) {
+                showError("No radio is selected.\nSelect a VFO in the waterfall first.");
+                return;
+            }
+            sr = sigpath::vfoManager.getBandwidth(vfoName);
+            offset = sigpath::vfoManager.getOffset(vfoName);
+        }
+        else if (recSource == REC_SRC_MANUAL) {
+            sr = sampleRate;
+        }
+        else {
+            sr = srcSr;
+        }
+
+        sr = clampToTxRange(sr, srcSr);
+
         // The VFO is owned by this module: SDR++ gives each VFO a single consumer,
         // and no other module touches a VFO it did not create itself.
-        recVfo = sigpath::vfoManager.createVFO(name + "_txrec", ImGui::WaterfallVFO::REF_CENTER, 0,
-                                               sampleRate, sampleRate, sampleRate, sampleRate, true);
+        recVfo = sigpath::vfoManager.createVFO(name + "_txrec", ImGui::WaterfallVFO::REF_CENTER, offset,
+                                               sr, sr, sr, sr, true);
         if (!recVfo) {
             showError("Could not create the recording VFO.");
             return;
         }
 
         // Absolute centre of the recorded slice
-        recFreq = gui::waterfall.getCenterFrequency() + recVfo->getOffset();
-        recSampleRate = sampleRate;
+        recFreq = gui::waterfall.getCenterFrequency() + offset;
+        recSampleRate = (int)sr;
+        recSourceSr = srcSr;
         recSamples = 0;
 
         std::error_code ec;
@@ -277,6 +335,11 @@ private:
         bool isInt16 = (info.format == 1 && info.bitsPerSample == 16);
         if (info.channels != 2 || (!isFloat && !isInt16)) {
             fail("Unsupported recording format.\nOnly 2-channel 16-bit PCM or 32-bit float WAV can be transmitted.");
+            return;
+        }
+        if (info.sampleRate < HACKRF_MIN_TX_SR || info.sampleRate > HACKRF_MAX_TX_SR) {
+            fail("Recording is " + srStr((double)info.sampleRate) + ".\n"
+                 "The HackRF can only transmit between 2 and 20 MS/s.");
             return;
         }
         if (info.dataSize == 0) {
@@ -430,6 +493,83 @@ private:
         double secs = (sr > 0.0) ? (samples / sr) : 0.0;
         snprintf(buf, sizeof(buf), "%.2f s", secs);
         return std::string(buf);
+    }
+
+    static std::string srStr(double sr) {
+        char buf[64];
+        if (sr >= 1e6) { snprintf(buf, sizeof(buf), "%.2f MS/s", sr / 1e6); }
+        else if (sr >= 1e3) { snprintf(buf, sizeof(buf), "%.1f kS/s", sr / 1e3); }
+        else { snprintf(buf, sizeof(buf), "%.0f S/s", sr); }
+        return std::string(buf);
+    }
+
+    // Keep a recording inside both the source bandwidth and the HackRF TX range.
+    // A source narrower than 2 MS/s wins: the file is still usable for analysis,
+    // it just cannot be transmitted 1:1.
+    static double clampToTxRange(double sr, double srcSr) {
+        double maxSr = std::min(srcSr, (double)HACKRF_MAX_TX_SR);
+        double minSr = std::min((double)HACKRF_MIN_TX_SR, maxSr);
+        return std::clamp(sr, minSr, maxSr);
+    }
+
+    // Open a directory in the system file manager.
+    //
+    // Windows: ShellExecuteW. Going through std::system() spawns a cmd.exe
+    // console (visible flash) and blocks the UI thread until it returns, and
+    // Explorer misparses paths that mix '/' with the native separator, which is
+    // what "opens the wrong folder" looked like.
+    // POSIX: a double fork plus exec, so the child is reparented and leaves no
+    // zombie behind and the UI never waits for the file manager to exit.
+    static void openFolder(const std::string& dir) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+
+        std::filesystem::path p = std::filesystem::u8path(dir);
+        std::filesystem::path abs = std::filesystem::absolute(p, ec);
+        if (!ec) { p = abs; }
+
+        flog::info("HackRFTx: opening folder '{0}'", p.string());
+
+#ifdef _WIN32
+        std::wstring native = p.make_preferred().wstring();
+        ShellExecuteW(NULL, L"open", native.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#else
+#ifdef __APPLE__
+        const char* opener = "open";
+#else
+        const char* opener = "xdg-open";
+#endif
+        std::string arg = p.string();
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (fork() != 0) { _exit(0); }
+            execlp(opener, opener, arg.c_str(), (char*)NULL);
+            _exit(127);
+        }
+        if (pid > 0) { waitpid(pid, NULL, 0); }
+#endif
+    }
+
+    // Sample rate the next recording would use, for the menu preview
+    double previewSampleRate() {
+        double srcSr = sigpath::iqFrontEnd.getSampleRate();
+        if (srcSr <= 0.0) { return 0.0; }
+        if (recSource == REC_SRC_RADIO) {
+            std::string n = gui::waterfall.selectedVFO;
+            if (n.empty() || !sigpath::vfoManager.vfoExists(n)) { return 0.0; }
+            return clampToTxRange(sigpath::vfoManager.getBandwidth(n), srcSr);
+        }
+        if (recSource == REC_SRC_MANUAL) { return clampToTxRange(sampleRate, srcSr); }
+        return clampToTxRange(srcSr, srcSr);
+    }
+
+    // Centre frequency the next recording would use
+    double previewCenterFreq() {
+        double c = gui::waterfall.getCenterFrequency();
+        if (recSource != REC_SRC_RADIO) { return c; }
+        std::string n = gui::waterfall.selectedVFO;
+        if (n.empty() || !sigpath::vfoManager.vfoExists(n)) { return c; }
+        return c + sigpath::vfoManager.getOffset(n);
     }
 
     static std::string freqStr(double freq) {
@@ -664,14 +804,51 @@ private:
         ImGui::Separator();
 
         if (st == STATE_RECORDING) { ImGui::BeginDisabled(); }
-        ImGui::LeftLabel("Sample rate");
+
+        ImGui::LeftLabel("Source");
         ImGui::FillWidth();
-        if (ImGui::Combo(CONCAT("##hackrf_tx_sr_", _this->name), &_this->sampleRateId, SAMPLE_RATES_TXT)) {
-            _this->sampleRate = SAMPLE_RATES[_this->sampleRateId];
+        if (ImGui::Combo(CONCAT("##hackrf_tx_recsrc_", _this->name), &_this->recSourceId, REC_SOURCE_TXT)) {
+            _this->recSource = (RecSource)_this->recSourceId;
             config.acquire();
-            config.conf["sampleRate"] = _this->sampleRate;
+            config.conf["recSource"] = _this->recSourceId;
             config.release(true);
         }
+
+        if (_this->recSource == REC_SRC_MANUAL) {
+            ImGui::LeftLabel("Sample rate");
+            ImGui::FillWidth();
+            if (ImGui::Combo(CONCAT("##hackrf_tx_sr_", _this->name), &_this->sampleRateId, SAMPLE_RATES_TXT)) {
+                _this->sampleRate = SAMPLE_RATES[_this->sampleRateId];
+                config.acquire();
+                config.conf["sampleRate"] = _this->sampleRate;
+                config.release(true);
+            }
+        }
+        else {
+            double psr = _this->previewSampleRate();
+            ImGui::LeftLabel("Sample rate");
+            ImGui::FillWidth();
+            if (psr <= 0.0) {
+                ImGui::TextUnformatted("no radio selected");
+            }
+            else if (psr < HACKRF_MIN_TX_SR) {
+                // A narrow source limits the recording below the TX range
+                ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f), "%s (below TX min)",
+                                   srStr(psr).c_str());
+            }
+            else {
+                ImGui::TextUnformatted(srStr(psr).c_str());
+            }
+        }
+
+        if (_this->recSource == REC_SRC_RADIO) {
+            ImGui::TextWrapped("Clamped to the HackRF minimum of 2 MS/s, so the slice is wider "
+                               "than the radio bandwidth but centred on it.");
+        }
+
+        ImGui::LeftLabel("Centre");
+        ImGui::FillWidth();
+        ImGui::TextUnformatted(freqStr(_this->previewCenterFreq()).c_str());
 
         ImGui::LeftLabel("Depth");
         ImGui::FillWidth();
@@ -680,6 +857,7 @@ private:
             config.conf["recDepth"] = _this->recDepthId;
             config.release(true);
         }
+
         if (st == STATE_RECORDING) { ImGui::EndDisabled(); }
 
         if (st == STATE_IDLE) {
@@ -701,6 +879,7 @@ private:
         if (st == STATE_RECORDING) {
             ImGui::Text("Recording  %s", durationStr(_this->recSamples, _this->recSampleRate).c_str());
             ImGui::Text("Centre     %s", freqStr(_this->recFreq).c_str());
+            ImGui::Text("Rate       %s", srStr(_this->recSampleRate).c_str());
             ImGui::TextWrapped("Keep the recording selector in place; the centre frequency is "
                                "captured when the recording starts.");
         }
@@ -724,13 +903,7 @@ private:
         }
         ImGui::SameLine();
         if (ImGui::Button(CONCAT("Open folder##hackrf_tx_open_", _this->name))) {
-            std::error_code ec;
-            std::filesystem::create_directories(_this->recDir, ec);
-#ifdef _WIN32
-            std::system(("explorer \"" + _this->recDir + "\"").c_str());
-#else
-            std::system(("xdg-open \"" + _this->recDir + "\" &").c_str());
-#endif
+            openFolder(_this->recDir);
         }
 
         ImGui::Spacing();
@@ -821,6 +994,9 @@ private:
     int sampleRateId = 0;
     int sampleRate = 2000000;
     int recDepthId = REC_DEPTH_INT16;
+    int recSourceId = REC_SRC_WATERFALL;
+    RecSource recSource = REC_SRC_WATERFALL;
+    double recSourceSr = 0.0;
     VFOManager::VFO* recVfo = NULL;
     wav::Writer recWriter;
     dsp::sink::Handler<dsp::complex_t> recHandler;
@@ -855,6 +1031,7 @@ MOD_EXPORT void _INIT_() {
     json def = json({});
     def["sampleRate"] = 2000000;
     def["recDepth"] = 0;
+    def["recSource"] = 0;
     def["txVgaGain"] = 20;
     def["amp"] = false;
     def["txFreq"] = 0.0;
